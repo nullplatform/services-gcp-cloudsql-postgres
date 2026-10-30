@@ -29,8 +29,12 @@ run_link() {
     CONTEXT=$(jq -c ".notification | $patch" "$SCRIPT_DIR/link.json"); export CONTEXT
     LINK=$(echo "$CONTEXT" | jq '.link'); export LINK
     export SERVICE_PATH VALUES="$TMP/values.yaml" ACTION_SOURCE=link
+    # The trap writes to fd 3, a copy of the subshell's stdout: an "exit" inside
+    # a sourced script fires it while that script's own redirection is still
+    # active, and bash 5 would send the dump into bpc.out.
+    exec 3>&1
     # shellcheck disable=SC2154  # v is the loop variable inside the trap string
-    trap 'for v in OUTPUT_DIR TOFU_MODULE_DIR TOFU_INIT_VARIABLES TOFU_VARIABLES NP_SKIP_TOFU; do printf "%s=%s\n" "$v" "${!v:-}"; done' EXIT
+    trap 'for v in OUTPUT_DIR TOFU_MODULE_DIR TOFU_INIT_VARIABLES TOFU_VARIABLES NP_SKIP_TOFU; do printf "%s=%s\n" "$v" "${!v:-}"; done >&3' EXIT
     # shellcheck source=/dev/null
     source "$SERVICE_PATH/scripts/build_context" >"$TMP/bpc.out" 2>&1
     # shellcheck source=/dev/null
