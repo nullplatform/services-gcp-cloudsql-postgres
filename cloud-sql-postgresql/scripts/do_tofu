@@ -51,7 +51,7 @@ fi
 # production" stop meaning the same tofu.
 # ---------------------------------------------------------------------------
 if ! command -v tofu &>/dev/null; then
-  TOFU_VERSION="${TOFU_VERSION:-1.13.1}"
+  TOFU_VERSION="${TOFU_VERSION:-1.13.2}"
   TOFU_BIN_DIR="/tmp/np-tofu-bin"
   TOFU_BIN="$TOFU_BIN_DIR/tofu"
 

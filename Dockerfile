@@ -4,7 +4,7 @@ FROM public.ecr.aws/nullplatform/scopes/worker-bridge:2.0.7
 
 # OpenTofu, pinned, so no action downloads it at runtime. Keep TOFU_VERSION in
 # sync with .github/workflows/terraform.yml and with scripts/do_tofu's fallback.
-ARG TOFU_VERSION=1.13.1
+ARG TOFU_VERSION=1.13.2
 # TARGETARCH is a BuildKit built-in and is empty under the legacy builder.
 ARG TARGETARCH
 RUN set -eu; \

@@ -20,7 +20,7 @@ jobs:
         with:
           # Must match the Dockerfile's TOFU_VERSION and do_tofu's fallback, or
           # this job validates a different tofu than the one that applies.
-          tofu_version: 1.13.1
+          tofu_version: 1.13.2
       - name: tofu fmt
         run: tofu fmt -check -recursive ${{ matrix.module }}
       - name: tofu init (no backend)
