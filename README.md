@@ -221,24 +221,34 @@ module:
 ```hcl
   worker_orchestrated_packages = ["containers", "gcp-cloud-sql-postgresql"]
 
+  extra_envs = {
+    SERVICES_GCP_REGION     = "<region>"
+    SERVICES_GCP_NETWORK    = "<vpc name>"
+    SERVICES_TFSTATE_BUCKET = "<tfstate bucket>"
+  }
+
   worker = {
     patches = [{
       target = { package = "gcp-cloud-sql-postgresql" }
       merge = {
         spec = {
           containers = [{
-            name = "worker"
-            env = [
-              { name = "SERVICES_GCP_REGION", value = "<region>" },
-              { name = "SERVICES_GCP_NETWORK", value = "<vpc name>" },
-              { name = "SERVICES_TFSTATE_BUCKET", value = "<tfstate bucket>" },
-            ]
+            name    = "worker"
+            envFrom = [{ secretRef = { name = "<agent-secret>" } }]
           }]
         }
       }
     }]
   }
 ```
+
+Listing the package in `worker_orchestrated_packages` is what runs its worker
+as the agent's Kubernetes service account, the identity the GCP permissions
+are granted to. The `envFrom` is required: the module hands its environment
+only to the `containers` worker, and `extra_envs` land in the agent's Helm
+secret (`<release>-secret-<chart>`, `nullplatform-agent-secret-nullplatform-agent`
+with the module's defaults), which the patch mounts. Same model as the Azure
+services, minus the credentials: nothing secret is needed here.
 
 **2 — The service specification**, with the worker image pinned:
 
