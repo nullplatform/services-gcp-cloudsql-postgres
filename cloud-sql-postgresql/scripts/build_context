@@ -271,13 +271,29 @@ LABELS=$(echo "$CONTEXT" | jq -c '.tags // {}
     | .value |= (tostring | ascii_downcase | gsub("[^a-z0-9_-]"; "_") | .[0:63]))
   | with_entries(select(.key | test("^[a-z]")))')
 
+# --- Placeholders for the actions that do not shape the instance -----------
+# A delete may legitimately see database_name, region or network empty: the
+# create failed before the attributes were written, or the placement is no
+# longer configured. "tofu destroy" still evaluates every variable validation,
+# and an empty string fails all three, which would leave the service stuck in
+# failed. Destroy works from state alone, so syntactically valid placeholders
+# are enough there; only the tfvars get them, the exported values stay real.
+TF_DATABASE_NAME="$DATABASE_NAME"
+TF_REGION="$REGION"
+TF_NETWORK="$NETWORK"
+if [ "$SERVICE_WRITE" != "true" ]; then
+  [ -z "$TF_DATABASE_NAME" ] && TF_DATABASE_NAME="np_unset"
+  [ -z "$TF_REGION" ]        && TF_REGION="np-unset1"
+  [ -z "$TF_NETWORK" ]       && TF_NETWORK="projects/${PROJECT_ID}/global/networks/np-unset"
+fi
+
 TOFU_VARIABLES=$(jq -nc \
   --arg     service_id            "$SERVICE_ID" \
   --arg     instance_name         "$INSTANCE_NAME" \
   --arg     project_id            "$PROJECT_ID" \
-  --arg     region                "$REGION" \
-  --arg     network               "$NETWORK" \
-  --arg     database_name         "$DATABASE_NAME" \
+  --arg     region                "$TF_REGION" \
+  --arg     network               "$TF_NETWORK" \
+  --arg     database_name         "$TF_DATABASE_NAME" \
   --arg     postgres_version      "$POSTGRES_VERSION" \
   --arg     tier                  "$TIER" \
   --argjson disk_size_gb          "$DISK_SIZE_GB" \

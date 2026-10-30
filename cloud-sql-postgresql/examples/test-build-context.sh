@@ -320,6 +320,30 @@ assert_eq "" "$(get "$NO_RN_DEL" NETWORK)" "no network on delete stays empty, no
 expect_ok "read needs neither region nor network" "$NO_RN" "$(ctx create.json '.type = "custom" | .slug = "read"')"
 expect_ok "a link action needs neither region nor network" "$NO_RN" "$(ctx link.json)"
 
+echo "== delete after a failed create: placeholders keep tofu destroy past the variable validations =="
+# The create failed before writing any attribute, and no placement is set:
+# tofu destroy evaluates every validation, and "" fails database_name, region
+# and network alike.
+BARE_DEL=$(run_bc "$NO_RN" "$(ctx create.json '.type = "delete" | .parameters = {} | .service.attributes = {}')") && RC=0 || RC=$?
+assert_eq "0" "$RC" "delete with no database_name, region or network succeeds"
+BARE_TF=$(get "$BARE_DEL" TOFU_VARIABLES)
+VARS_TF="$SERVICE_PATH/deployment/variables.tf"
+# module_regex <variable>: the regex in that variable's validation block.
+module_regex() {
+  sed -n "/variable \"$1\"/,/^}/p" "$VARS_TF" | sed -n 's/.*regex("\(.*\)", var.*/\1/p' | sed 's/\\\\/\\/g' | head -1
+}
+for v in database_name region network; do
+  val=$(printf '%s' "$BARE_TF" | jq -r ".$v")
+  assert_eq "yes" "$([ -n "$val" ] && echo yes || echo no)" "tfvars $v is not empty on delete"
+  assert_eq "match" "$(printf '%s' "$val" | grep -Eq "$(module_regex "$v")" && echo match || echo "no match: $val")" "tfvars $v passes the module's validation"
+done
+assert_eq "" "$(get "$BARE_DEL" DATABASE_NAME)" "the exported DATABASE_NAME stays empty: placeholders live in the tfvars only"
+assert_eq "" "$(get "$BARE_DEL" REGION)" "the exported REGION stays empty"
+STORED_DEL=$(run_bc "$NO_RN" "$(ctx create.json '.type = "delete" | .parameters = {} | .service.attributes = {"database_name":"conciliation"}')" SERVICES_GCP_REGION=us-east1 SERVICES_GCP_NETWORK=v)
+assert_eq "conciliation" "$(get "$STORED_DEL" TOFU_VARIABLES | jq -r .database_name)" "a stored database_name wins over the placeholder"
+assert_eq "us-east1" "$(get "$STORED_DEL" TOFU_VARIABLES | jq -r .region)" "a configured region wins over the placeholder"
+expect_reject "create still refuses an empty database_name" "$TMP/values.yaml" "$(ctx create.json '.parameters = {} | .service.attributes = {}')"
+
 echo "== region and network formats are checked =="
 expect_reject "malformed region rejected" "$NO_RN" "$(ctx create.json)" SERVICES_GCP_REGION="US East" SERVICES_GCP_NETWORK=v
 expect_reject "zone given as region rejected" "$NO_RN" "$(ctx create.json)" SERVICES_GCP_REGION="us-east1-b" SERVICES_GCP_NETWORK=v
