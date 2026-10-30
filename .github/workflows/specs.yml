@@ -1,0 +1,16 @@
+name: specs
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate service and link specs
+        run: bash cloud-sql-postgresql/examples/validate-specs.sh
+      - name: Run unit tests
+        run: bash cloud-sql-postgresql/examples/run-all-tests.sh

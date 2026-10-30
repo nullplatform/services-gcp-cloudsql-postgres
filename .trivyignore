@@ -1,0 +1,5 @@
+# Trivy misconfiguration suppressions for this repo (intentional, documented).
+#
+# None yet. The Azure suppressions this service started from do not apply:
+# the instance has no public IP and enforces TLS. Add a GCP check here only
+# with the reason it does not apply, after the first trivy run on a PR.

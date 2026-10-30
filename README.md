@@ -1,91 +1,382 @@
-# my-service
+# GCP Cloud SQL PostgreSQL Service
 
-Template for new nullplatform `services-*` repositories: the CI every service repo needs and the minimal structure the agent runs. Everything specific to your service is yours to add.
+Nullplatform **dependency service** that provisions and manages a Cloud SQL
+for PostgreSQL instance. Each service instance is one Cloud SQL instance with
+one database; each application link creates a dedicated PostgreSQL role with
+grants for its access level, so apps authenticate with their own credentials
+and never see the administrator's.
 
-## Start here
+The service lives under [`cloud-sql-postgresql/`](./cloud-sql-postgresql). It
+is a port of [services-postgresql-flexible-server](https://github.com/nullplatform/services-postgresql-flexible-server)
+(Azure): the link model, the role and grant management, the OpenTofu
+execution and the three-tier configuration are the same code. What changes is
+the cloud: the instance, private networking, the GCS state backend and the
+credentials, which come from Workload Identity instead of a secret.
 
-1. Replace `my-service` everywhere with your service slug (directory, `Dockerfile`, `mise.toml`, specs, `.github/workflows/*`):
-   ```bash
-   git mv my-service <slug>
-   grep -rl my-service . --exclude-dir=.git | xargs perl -pi -e 's/my-service/<slug>/g'
-   ```
-   Then set the display name (`"name": "My Service"`) in `<slug>/specs/service-spec.json.tpl`, and its `selectors`
-   (`category`, `sub_category`, `provider`) there and in `<slug>/specs/links/*.json.tpl` — the template's `Other` / `Other` / `AWS`
-   is what the nullplatform catalog and the docs [Sample services](https://docs.nullplatform.com/docs/services/sample-services) page show.
-   Keep the repository named `services-<slug>`: the docs catalog finds sample repositories by that prefix once they
-   have a release. A one-line GitHub description is welcome (`gh repo edit nullplatform/<repo> --description "..."`).
-   The release refuses to run while any template placeholder is left.
-2. Add the **Public ECR** service to the application in nullplatform. It creates the ECR Public repository and the publisher role; then set the secret and variable in [Publishing](#publishing).
-3. Write your steps in `<slug>/scripts/` and wire them in `<slug>/workflows/*.yaml`; define attributes in `<slug>/specs/`.
-4. Merge to `main` with a `feat:` or `fix:` commit: release-please opens the release PR, and merging it publishes the image.
+## What It Does
 
-## Layout
+- Provisions a Cloud SQL instance (version, machine tier, SSD size, backup
+  retention, optional regional HA) and a database via OpenTofu, with a
+  **private IP only** and TLS enforced (`ssl_mode = ENCRYPTED_ONLY`)
+- Creates a PostgreSQL role per link, with a generated password and grants
+  derived from the link's access level; drops it on unlink, keeping the data
+- Exposes `{LINK}_HOSTNAME` / `{LINK}_PORT` / `{LINK}_DATABASE_NAME` from the
+  service, and **`DATABASE_URL` / `DATABASE_USER` / `DATABASE_PASSWORD`** from
+  the link, the names a Spring Boot `container` profile reads without mapping
+- Stores OpenTofu state in a shared GCS bucket under a per-service prefix
+  (`cloud-sql-postgresql/<service_id>/`)
+- Authenticates to GCP as the agent's Kubernetes service account, through
+  Workload Identity Federation: no GCP service account key anywhere
+- Ships as an OCI worker image: the channel routes `package-exec` to a worker
+  built from this repository's [`Dockerfile`](./Dockerfile), with OpenTofu
+  baked in
+
+## Repository Layout
 
 ```
-my-service/
-  entrypoint/   entrypoint (agent calls it), service and link (route an action to its workflow)
-  workflows/    one YAML per action: create, update, delete, link, link-update, unlink
-  scripts/      the steps the workflows run (example is a placeholder)
-  specs/        service-spec.json.tpl and links/connect.json.tpl
-  values.yaml   static configuration for the workflows
-Dockerfile      worker image on the shared worker-bridge base
-mise.toml       run it on your machine as a package (`np package run`)
+.
+├── cloud-sql-postgresql/
+│   ├── specs/
+│   │   ├── service-spec.json.tpl         # Service schema (attributes the user sees)
+│   │   ├── links/database-user.json.tpl  # Link schema (access level, credentials)
+│   │   ├── requirements/gcp/             # OpenTofu: IAM for the worker, tfstate bucket
+│   │   └── install/gcp/                  # OpenTofu: standalone registration module
+│   ├── deployment/                       # OpenTofu module: instance, database, admin user
+│   ├── permissions/                      # OpenTofu module: role + grants (per link)
+│   ├── workflows/                    # Workflow YAMLs (create/update/delete/link/link-update/unlink/read)
+│   ├── scripts/                      # placement resolution, tofu execution, output writing
+│   ├── entrypoint/                       # entrypoint/service/link (agent entrypoint)
+│   ├── examples/                         # fixtures and the offline test harness
+│   └── values.yaml                       # Static config, optional — all keys may stay empty
+├── Dockerfile                            # worker image: worker-bridge + OpenTofu + this service
+├── mise.toml                             # run it on your machine as a package (np package run)
+└── README.md
 ```
 
-A custom action slug `foo` runs `workflows/foo.yaml`.
+## Service Configuration Parameters
+
+Exposed in the nullplatform UI when creating/updating the service:
+
+| Parameter | Type | Default | Allowed Values | Editable After Create |
+|---|---|---|---|---|
+| `database_name` | string | — (required) | `^[a-z][a-z0-9_]{0,62}$` | No |
+| `postgres_version` | string | `16` | `15`, `16`, `17` | No |
+| `tier` | string | `db-g1-small` | `db-f1-micro`, `db-g1-small`, `db-custom-1-3840`, `db-custom-2-7680`, `db-custom-4-16384` | Yes |
+| `disk_size_gb` | number | `10` | 10–1024 | Yes (grow only) |
+| `backup_retention_days` | number | `7` | 1–365 daily backups | Yes |
+| `high_availability` | bool | `false` | | Yes (ignored on shared-core tiers) |
+
+The edition (`ENTERPRISE`, so the shared-core tiers stay available), private
+IP only, TLS enforcement and the administrator login (`npadmin`) are fixed in
+the module and deliberately not exposed.
+
+**Instance naming**: `<sanitized-service-name>-<first 8 chars of service ID>`,
+starting with a letter, capped at 63 characters. Computed once on first
+create, then persisted and read back on every later action — recomputing it
+after a rename would force `replace` on the instance and destroy every
+database in it.
+
+## Link Parameters (`database-user`)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `access_level` | enum | `admin` | `read`, `read-write`, `admin` |
+
+`access_level` maps onto grants, all on the `public` schema of the service's
+database:
+
+| Access level | Database | Schema `public` | Tables | Sequences |
+|---|---|---|---|---|
+| `read` | CONNECT | USAGE | SELECT | SELECT |
+| `read-write` | CONNECT, TEMPORARY | USAGE | SELECT, INSERT, UPDATE, DELETE | SELECT, USAGE, UPDATE |
+| `admin` | CONNECT, CREATE, TEMPORARY | USAGE, CREATE | ALL | ALL |
+
+`admin` is the default because the first consumers run their own migrations
+(Flyway, Liquibase, Prisma): they need CREATE on the database to create their
+schema and CREATE on `public` for the migration history table.
+
+## Service Attributes (post-create, exported as env vars)
+
+| Attribute | Description |
+|---|---|
+| `hostname` | Private IP address of the instance |
+| `port` | `5432` |
+| `database_name` | The database |
+
+Names are `{LINK_SLUG_UPPER}_{ATTRIBUTE_UPPER}` with hyphens removed from the
+slug: a link slugged `db-main` yields `DBMAIN_HOSTNAME`, `DBMAIN_PORT` and
+`DBMAIN_DATABASE_NAME`.
+
+`instance_name`, `connection_name` and `project_id` are also stored, but not
+exported — `instance_name` is what keeps the name stable across renames, and
+`connection_name` is what the Cloud SQL Auth Proxy and the language
+connectors take, for applications that prefer them.
+
+## Link Attributes (per link, exported as env vars)
+
+| Attribute | Env var | Type | Description |
+|---|---|---|---|
+| `username` | `DATABASE_USER` | plain | The link's role, `u_<app>_<link id prefix>` |
+| `password` | `DATABASE_PASSWORD` | secret | Its password, 32 alphanumerics |
+| `jdbc_url` | `DATABASE_URL` | plain | `jdbc:postgresql://<private ip>:5432/<db>?sslmode=require`, no credentials |
+
+The link uses `export.target` to fix these names instead of the
+`{LINK}_...` convention, so an application reads them with no mapping. The
+consequence is that **one scope can consume one link of this service**: two
+links to two instances would both try to export `DATABASE_URL`.
+
+## Workflows
+
+| Workflow | Trigger | What It Does |
+|---|---|---|
+| `create` | Service created | Creates the instance, the database and the administrator user |
+| `update` | Service updated | Re-applies tier, disk size, backup retention and HA |
+| `delete` | Service deleted | **Destroys the instance**, its database, its backups and all data |
+| `link` | Application linked | Creates the role with its grants |
+| `link-update` | Link updated | Reapplies the grants after an `access_level` change; password unchanged |
+| `unlink` | Application unlinked | **Drops the role**; its objects are reassigned to the administrator, data is kept |
+| `read` | Read action | Reports current attributes; touches nothing in GCP |
+
+## Requirements
+
+### nullplatform prerequisites
+
+- An agent with worker orchestration enabled on a GKE cluster with Workload
+  Identity, and this service's package slug (`gcp-cloud-sql-postgresql`)
+  listed in the agent module's `worker_orchestrated_packages`. Listing it is
+  what makes the worker pod run as the agent's Kubernetes service account
+- The worker's placement (region, VPC, tfstate bucket); see "Configuration"
+- A GCS bucket for OpenTofu state, which this service never creates
+  (`specs/requirements/gcp` can)
+
+### GCP prerequisites
+
+- APIs `sqladmin.googleapis.com` and `servicenetworking.googleapis.com`
+  enabled on the project
+- **Private Service Access** on the VPC: a reserved internal range and the
+  `servicenetworking.googleapis.com` peering. Every instance gets its private
+  IP from that range
+- The agent's cluster in that same VPC (VPC-native): the link action connects
+  to the instance from the worker pod, and the linked applications from their
+  own pods
+
+### GCP permissions
+
+The worker authenticates as the Kubernetes service account
+`nullplatform-tools/nullplatform-agent` (the tofu-modules agent defaults).
+Grant the roles to that identity directly, as a Workload Identity Federation
+principal:
+
+```
+principal://iam.googleapis.com/projects/<project number>/locations/global/workloadIdentityPools/<project id>.svc.id.goog/subject/ns/nullplatform-tools/sa/nullplatform-agent
+```
+
+| On | Role | For |
+|---|---|---|
+| The project | `roles/cloudsql.admin` | creating instances, databases and users |
+| The tfstate bucket | `roles/storage.objectAdmin` | reading and writing state |
+
+[`specs/requirements/gcp`](cloud-sql-postgresql/specs/requirements/gcp)
+grants both, and can create the bucket and enable the APIs. Private Service
+Access is left to the network layer that owns the VPC.
+
+### Runtime dependencies
+
+- **OpenTofu** — baked into the worker image at the version pinned by the
+  Dockerfile's `TOFU_VERSION`. `do_tofu` keeps a download fallback for agents
+  without it, but the packaged deployment never uses it.
+- `bash`, `jq`, `np` and `curl` ship in the `worker-bridge` base image.
+- **No `gcloud`, no `psql`**: the google provider uses Application Default
+  Credentials, and roles and grants are managed by the `cyrilgdn/postgresql`
+  Terraform provider over TLS.
+
+## Configuration
+
+Three tiers, each field resolved independently, highest first:
+
+1. `cloud-sql-postgresql/values.yaml` (committed; ships empty)
+2. The account's cloud-providers (GCP) provider config
+3. The worker's environment
+
+| Setting | values.yaml | Provider | Environment |
+|---|---|---|---|
+| Project | `project_id` | `project.id` (published by tofu-modules) | `SERVICES_GCP_PROJECT`, then `GOOGLE_CLOUD_PROJECT` |
+| Region | `region` | `services.region` | `SERVICES_GCP_REGION` |
+| VPC | `network` (name or `projects/<p>/global/networks/<n>`) | `services.network` | `SERVICES_GCP_NETWORK` |
+| State bucket | `tfstate_bucket` | `services.tfstate.bucket` | `SERVICES_TFSTATE_BUCKET` |
+
+The `services` block is not part of the schema tofu-modules publishes for the
+GCP provider (whether the provider specification accepts it is not
+confirmed), so the documented install sets region, VPC and bucket in the
+worker's environment, as below.
+
+## How to register this service in nullplatform
+
+Three pieces, in three layers.
+
+**1 — The agent** must run the worker and give it the placement. In the
+[`nullplatform/agent`](https://github.com/nullplatform/tofu-modules/tree/main/nullplatform/agent)
+module:
+
+```hcl
+  worker_orchestrated_packages = ["containers", "gcp-cloud-sql-postgresql"]
+
+  worker = {
+    patches = [{
+      target = { package = "gcp-cloud-sql-postgresql" }
+      merge = {
+        spec = {
+          containers = [{
+            name = "worker"
+            env = [
+              { name = "SERVICES_GCP_REGION", value = "<region>" },
+              { name = "SERVICES_GCP_NETWORK", value = "<vpc name>" },
+              { name = "SERVICES_TFSTATE_BUCKET", value = "<tfstate bucket>" },
+            ]
+          }]
+        }
+      }
+    }]
+  }
+```
+
+**2 — The service specification**, with the worker image pinned:
+
+```hcl
+module "service_definition_cloud_sql_postgresql" {
+  source              = "git::https://github.com/nullplatform/tofu-modules.git//nullplatform/service_definition?ref=<tofu-modules tag>"
+  nrn                 = var.nrn
+  service_path        = "cloud-sql-postgresql"
+  service_name        = "GCP Cloud SQL PostgreSQL"
+  repository_name     = "services-gcp-cloudsql-postgres"
+  repository_branch   = "<tag>"
+  repository_ref_type = "tags"
+  available_links     = ["database-user"]
+
+  package = {
+    version = "<semver>"
+    artifacts = [{
+      name   = "worker-image"
+      type   = "oci_image"
+      lookup = true
+      meta = {
+        registry   = "public.ecr.aws"
+        repository = "nullplatform/agent-plugins/services/cloud-sql-postgresql"
+        tag        = "<tag>"
+      }
+    }]
+  }
+}
+```
+
+The module derives the package slug from `service_name` (lowercased, spaces
+to hyphens): "GCP Cloud SQL PostgreSQL" gives `gcp-cloud-sql-postgresql`, the
+`NP_PACKAGE_NAME` baked into the worker image. Another name applies cleanly
+and fails on first use.
+
+**3 — The channel association**, routing the action to the worker:
+
+```hcl
+module "service_agent_association_cloud_sql_postgresql" {
+  source                     = "git::https://github.com/nullplatform/tofu-modules.git//nullplatform/service_definition_agent_association?ref=<tofu-modules tag>"
+  nrn                        = var.nrn
+  service_path               = "cloud-sql-postgresql"
+  service_specification_slug = module.service_definition_cloud_sql_postgresql.service_specification_slug
+  tags_selectors             = var.tags_selectors
+
+  worker_orchestrator = true
+  package_slug        = module.service_definition_cloud_sql_postgresql.service_specification_slug
+}
+```
+
+A ready-made version of pieces 2 and 3 lives in
+[`cloud-sql-postgresql/specs/install/gcp/`](cloud-sql-postgresql/specs/install/gcp)
+for a standalone install.
+
+## Important considerations
+
+### Delete destroys everything
+
+`delete` destroys the instance, which deletes the database, every role, all
+their data **and the automated backups**: Cloud SQL drops them with the
+instance. Unlink, by contrast, keeps the data: the role's objects are
+reassigned to the administrator before the role is dropped. A deleted
+instance's name stays reserved for up to a week; the service-id suffix keeps
+that from mattering.
+
+### Private IP only
+
+The instance has no public address. Anything that connects to it — the
+worker, the linked applications — must run in the peered VPC. Reaching it
+from a laptop needs the Cloud SQL Auth Proxy, outside this service.
+
+### Grants cover the public schema
+
+The role's grants apply to the `public` schema, to the tables that exist at
+link time, and — through default privileges — to tables the administrator
+creates later. Tables created by another link's `admin` role are owned by that
+role; a `read` link does not see them until their owner grants access. For a
+single application per database, the common case, this never comes up.
+
+### A password is issued once
+
+The link's password is generated on `link` and anchored in state; `link-update`
+changes grants and nothing else. Rotation is deleting and recreating the link.
+
+### The tfstate is a credential store
+
+The deployment state holds the administrator password and every link state
+holds its role's password. **Anyone with read access to the tfstate bucket
+holds every credential this service has issued.** Use a dedicated bucket and
+treat it like a vault.
+
+### Creation takes minutes
+
+Cloud SQL provisions an instance in roughly five to fifteen minutes. The
+`create` action runs that long; a link issued before `create` completes fails
+with a clear "hostname not found" error and can be retried.
+
+## Testing
+
+The offline suite needs no GCP session, no agent and no platform: it stubs
+`np` and `tofu` on `PATH`.
+
+```bash
+bash cloud-sql-postgresql/examples/run-all-tests.sh
+```
+
+A dry run parses a notification fixture, prints the derived variables and
+validates the Terraform module. It needs placement from somewhere: either fill
+`values.yaml` locally or export the worker's variables:
+
+```bash
+export SERVICES_GCP_PROJECT=<project> SERVICES_GCP_REGION=<region> SERVICES_GCP_NETWORK=<vpc> SERVICES_TFSTATE_BUCKET=<bucket>
+bash cloud-sql-postgresql/examples/dry-run.sh
+bash cloud-sql-postgresql/examples/dry-run.sh cloud-sql-postgresql/examples/link.json
+```
+
+`full-test.sh` applies the modules against a real GCP project, outside the
+platform. It creates real resources, and the link step only works from inside
+the peered VPC.
 
 ## Run locally as a package
 
 `np package run` runs this service on your machine the way production does: a
 local controlplane-agent that registers with the platform, spawns the worker
-image built from this repo, and hands it every action routed to it. No cluster,
-no publish. The two tasks in `mise.toml` are the whole contract with the CLI:
+image built from this repo, and hands it every action routed to it. The two
+tasks in `mise.toml` are the whole contract with the CLI:
 
 | Command | Runs | Does |
 |---|---|---|
-| `np package build --image` | `mise run build:image` | Builds `my-service-worker:dev` |
+| `np package build --image` | `mise run build:image` | Builds `cloud-sql-postgresql-worker:dev` |
 | `np package run` | `mise run run` | Builds the image, then starts the local agent |
 
-Prerequisites: **Docker** with host networking (Linux as is; on Docker Desktop
-enable *host networking*), **[mise](https://mise.jdx.dev)** (`mise trust` once
-here), an **`NP_API_KEY`** for the agent to register with, and `np` from the
-**alpha** channel, which carries `np package run`:
-
-```bash
-curl -fsSL https://cli.nullplatform.com/install.sh | VERSION=alpha sh   # ~/.local/bin/np
-np package run --help                                                   # must list --no-forward-env
-```
-
-```bash
-export NP_API_KEY=...
-eval "$(aws configure export-credentials --format env)"   # cloud credentials as variables
-np package run --log-level DEBUG                          # Ctrl+C to stop
-```
-
-The agent is tagged `package:my-service` and `local:<your user>`. It receives an
-action only when the service's notification channel selects those tags, so
-point a channel at `local:<your user>` to route work to your machine.
-
-> **Tags decide who gets the work.** Never start a local agent with tags a
-> production channel selects: it would receive production actions.
-
-`np package run` forwards your shell's environment to the agent container,
-minus what describes your machine (`PATH`, `HOME`, `DOCKER_*`, `KUBECONFIG`,
-`AWS_PROFILE` and the other file-pointing AWS variables), and the `run` task
-passes the same variables to the worker through an `NP_WORKER_RULES` entry.
-Every secret in your shell crosses too, and is readable with `docker inspect`;
-pass `--no-forward-env` to forward nothing.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `NP_API_KEY` | required | The key the agent registers with (`--api-key` also sets it) |
-| `NP_LOG_LEVEL` | `INFO` | Agent log level (`--log-level` also sets it) |
-| `NP_PACKAGE_SLUG` | `my-service` | The slug in the `package:<slug>` tag, when published under another slug |
-| `NP_LOCAL_USER` | `$USER` | The value of the `local:<user>` tag |
-| `NP_AGENT_IMAGE` | `controlplane-agent:latest` | The agent image; needs worker rules (0.11.1+) |
-
-The local run never changes what the platform runs. To ship the change, merge
-it: the release publishes the image and registers the artifact.
+The agent is tagged `package:gcp-cloud-sql-postgresql` and `local:<your user>`.
+It receives an action only when the service's notification channel selects
+those tags, so point a channel at `local:<your user>` to route work to your
+machine. **Never start a local agent with tags a production channel selects.**
+Locally, `create`, `update` and `delete` work with your ADC session; `link`
+does not, because a laptop cannot reach the private IP.
 
 ## CI
 
@@ -93,30 +384,22 @@ it: the release publishes the image and registers the artifact.
 |---|---|---|
 | branch-validation | PR | branch named `feat/…`, `fix/…`, `chore/…` |
 | conventional-commit | PR | commit messages (release-please reads them) |
+| specs | PR | service and link specs, plus the offline suite |
+| terraform | PR | `tofu fmt`, `init` and `validate` on the deployment, permissions and requirements modules |
 | shellcheck | PR | every bash script |
 | trivy | PR | IaC misconfiguration and image scan, to the Security tab |
-| beta | PR (opened, push, reopened) | publish-test-image-oci: pushes `beta/<image>:test-<branch>-<short sha>` and registers it as a nullplatform artifact |
+| beta | PR | pushes `beta/agent-plugins/services/cloud-sql-postgresql:test-<branch>-<short sha>` and registers it as a nullplatform artifact |
 | release | push to `main` | release-please → build and push `vX.Y.Z` and `latest` to ECR Public → nullplatform artifact → GitHub release |
 | auto-merge-release | after release | merges the release PR |
-| dependabot | daily / weekly | base image and shared workflow bumps |
-
-## Image tags
-
-| Image | Moved by | Use it to |
-|---|---|---|
-| `agent-plugins/services/<name>:vX.Y.Z` | its release, once | pin an exact version |
-| `agent-plugins/services/<name>:latest` | each release | follow the last released version |
-| `beta/agent-plugins/services/<name>:test-<branch>-<short sha>` | each push to a pull request of this repository | deploy a change to a test scope before merging it |
-
-Beta images live in a separate repository that the beta role can write and the production role cannot, so a beta can never overwrite a released image. Pull requests from this repository can assume the beta role (fork and bot pull requests are skipped), and the tag carries the commit SHA, so two pull requests never overwrite each other by accident. Nothing deletes beta tags: they are ephemeral by convention. Each beta is also registered as its own nullplatform oci_image artifact (the `beta/` repository, under `NP_ARTIFACT_NRN`), separate from the release artifact, so it can be deployed to a test scope from the platform.
 
 ## Publishing
 
-After adding the **Public ECR** service to the application, set in this repository:
+Set in this repository:
 
 | Name | Kind | Value |
 |---|---|---|
-| `AWS_ROLE_ARN_ECR_PUSH` | secret | the publisher role ARN the Public ECR service returns |
+| `AWS_ROLE_ARN_ECR_PUSH` | secret | the publisher role ARN for `agent-plugins/services/cloud-sql-postgresql` |
 | `NP_ARTIFACT_NRN` | variable | the NRN of the organization that owns the artifacts |
 
-`ARTIFACT_NP_API_KEY` comes from the organization. The release checks all three before building and fails with a clear error if one is missing. Beta images assume the role in the organization secret `AWS_BETA_ROLE_ARN` (no role is written in the workflow) and push to the image's `beta/` repository in ECR Public, which the dispatcher creates together with the production one. In this template repository neither workflow runs.
+`ARTIFACT_NP_API_KEY` comes from the organization. The release checks all
+three before building and fails with a clear error if one is missing.

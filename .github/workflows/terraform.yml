@@ -1,0 +1,29 @@
+name: terraform
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module:
+          - cloud-sql-postgresql/deployment
+          - cloud-sql-postgresql/permissions
+          - cloud-sql-postgresql/specs/requirements/gcp
+    steps:
+      - uses: actions/checkout@v7
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          # Must match the Dockerfile's TOFU_VERSION and do_tofu's fallback, or
+          # this job validates a different tofu than the one that applies.
+          tofu_version: 1.13.1
+      - name: tofu fmt
+        run: tofu fmt -check -recursive ${{ matrix.module }}
+      - name: tofu init (no backend)
+        run: tofu -chdir=${{ matrix.module }} init -backend=false -input=false
+      - name: tofu validate
+        run: tofu -chdir=${{ matrix.module }} validate

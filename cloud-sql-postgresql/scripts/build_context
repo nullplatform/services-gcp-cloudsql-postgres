@@ -1,0 +1,353 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# build_context — Turns the nullplatform notification into a Terraform
+# execution environment for service actions (create / update / delete / read).
+#
+# On link actions it additionally exports the LINK_* variables that
+# build_permissions_context consumes in the next workflow step.
+#
+# This script CREATES NOTHING in GCP and shells out to no cloud CLI. It only
+# derives names and paths. The tfstate bucket is required to exist already
+# (see the "tfstate location" section below), which is what makes every action
+# — `read` included — safe to run with no GCP credentials.
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/resolve_placement_lib"
+
+# Each script needs its own copy — shell functions do not carry across steps.
+# CRITICAL: $VALUES is a FILE PATH, not JSON content.
+yaml_value() {
+  local key="$1" default="$2" file="$3"
+  local raw val
+  raw=$(grep "^${key}:" "$file" 2>/dev/null | head -1) || true
+  if [ -z "$raw" ]; then
+    echo "$default"
+    return 0
+  fi
+
+  val="${raw#*:}"
+  # Trim leading whitespace.
+  val="${val#"${val%%[![:space:]]*}"}"
+
+  # A quoted value ends at its closing quote; anything after it (typically an
+  # inline comment) is not part of the value. An unquoted value ends at the
+  # first "#".
+  case "$val" in
+    '"'*) val="${val#\"}"; val="${val%%\"*}" ;;
+    "'"*) val="${val#\'}"; val="${val%%\'*}" ;;
+    *)
+      val="${val%%#*}"
+      val="${val%"${val##*[![:space:]]}"}"
+      ;;
+  esac
+
+  echo "${val:-$default}"
+}
+
+# --- Service identity -------------------------------------------------------
+
+SERVICE_ID=$(echo "$CONTEXT" | jq -r '.service.id')
+SERVICE_NAME=$(echo "$CONTEXT" | jq -r '.service.name // ""')
+
+if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
+  echo "ERROR: .service.id is missing from the notification context" >&2
+  exit 1
+fi
+
+# --- Merge stored attributes with this action's parameters ------------------
+# CRITICAL: on the first "create", .service.attributes is empty or incomplete;
+# user-supplied values arrive in .parameters. jq's * merges objects with the
+# right-hand side winning, so parameters always take precedence.
+
+SERVICE_ATTRS=$(echo "$CONTEXT" | jq -c '(.service.attributes // {}) * (.parameters // {})')
+
+# --- Instance name must be STABLE once created ------------------------------
+# instance_name is editableOn: [] in the spec, so it never legitimately
+# arrives via .parameters. A previously stored instance_name always wins:
+# recomputing it from .service.name on every action means renaming the
+# service instance in nullplatform computes a different name on the next
+# "update" — and "name" forces replacement on google_sql_database_instance,
+# destroying the instance and every database in it.
+STORED_INSTANCE_NAME=$(echo "$SERVICE_ATTRS" | jq -r '.instance_name // ""')
+
+if [ -n "$STORED_INSTANCE_NAME" ]; then
+  INSTANCE_NAME="$STORED_INSTANCE_NAME"
+else
+  INSTANCE_NAME=$("$SCRIPT_DIR/instance_name" "$SERVICE_NAME" "$SERVICE_ID")
+fi
+
+# Validate whichever value is used, not just the freshly-computed one: a
+# stored attribute could in principle be corrupted or hand-edited.
+if [[ ! "$INSTANCE_NAME" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+  echo "ERROR: instance name '${INSTANCE_NAME}' is not a valid Cloud SQL instance name" >&2
+  echo "       (required: up to 63 lowercase letters, digits and hyphens, starting with a letter, no trailing hyphen)" >&2
+  exit 1
+fi
+
+DATABASE_NAME=$(echo "$SERVICE_ATTRS"         | jq -r '.database_name         // ""')
+POSTGRES_VERSION=$(echo "$SERVICE_ATTRS"      | jq -r '.postgres_version      // "16"')
+TIER=$(echo "$SERVICE_ATTRS"                  | jq -r '.tier                  // "db-g1-small"')
+DISK_SIZE_GB=$(echo "$SERVICE_ATTRS"          | jq -r '.disk_size_gb          // 10')
+BACKUP_RETENTION_DAYS=$(echo "$SERVICE_ATTRS" | jq -r '.backup_retention_days // 7')
+HIGH_AVAILABILITY=$(echo "$SERVICE_ATTRS"     | jq -r '.high_availability     // false')
+
+# --- Validate ---------------------------------------------------------------
+# These come from an authenticated API caller but are still user input. The
+# module repeats the same rules in validation{} blocks so a hand-run
+# "tofu plan" enforces them too.
+#
+# database_name is the one attribute a `read` or `delete` may legitimately
+# see empty (an instance whose create never ran): only a SERVICE create or
+# update insists. On link actions .type describes the link, and the service
+# attributes are checked by build_permissions_context instead.
+
+ACTION_TYPE=$(echo "$CONTEXT" | jq -r '.type // ""')
+SERVICE_WRITE=false
+if [ "${ACTION_SOURCE:-service}" = "service" ] && [[ "$ACTION_TYPE" =~ ^(create|update)$ ]]; then
+  SERVICE_WRITE=true
+fi
+
+if [ -z "$DATABASE_NAME" ] && [ "$SERVICE_WRITE" = "true" ]; then
+  echo "ERROR: database_name is required" >&2
+  exit 1
+fi
+
+if [ -n "$DATABASE_NAME" ] && [[ ! "$DATABASE_NAME" =~ ^[a-z][a-z0-9_]{0,62}$ ]]; then
+  echo "ERROR: invalid database_name '${DATABASE_NAME}'" >&2
+  echo "       (expected 1-63 lowercase letters, digits and underscores, starting with a letter)" >&2
+  exit 1
+fi
+
+if [[ ! "$POSTGRES_VERSION" =~ ^(15|16|17)$ ]]; then
+  echo "ERROR: invalid postgres_version '${POSTGRES_VERSION}' (expected 15, 16 or 17)" >&2
+  exit 1
+fi
+
+if [[ ! "$TIER" =~ ^db-(f1-micro|g1-small|custom-[0-9]+-[0-9]+)$ ]]; then
+  echo "ERROR: invalid tier '${TIER}' (expected db-f1-micro, db-g1-small or db-custom-<vCPUs>-<MB>)" >&2
+  exit 1
+fi
+
+if [[ ! "$DISK_SIZE_GB" =~ ^[0-9]+$ ]] || [ "$DISK_SIZE_GB" -lt 10 ]; then
+  echo "ERROR: invalid disk_size_gb '${DISK_SIZE_GB}' (expected an integer of at least 10)" >&2
+  exit 1
+fi
+
+if [[ ! "$BACKUP_RETENTION_DAYS" =~ ^[0-9]+$ ]] || [ "$BACKUP_RETENTION_DAYS" -lt 1 ] || [ "$BACKUP_RETENTION_DAYS" -gt 365 ]; then
+  echo "ERROR: invalid backup_retention_days '${BACKUP_RETENTION_DAYS}' (expected an integer between 1 and 365)" >&2
+  exit 1
+fi
+
+if [[ ! "$HIGH_AVAILABILITY" =~ ^(true|false)$ ]]; then
+  echo "ERROR: invalid high_availability '${HIGH_AVAILABILITY}' (expected true or false)" >&2
+  exit 1
+fi
+
+# --- GCP placement ----------------------------------------------------------
+# Three tiers, resolved per field: values.yaml -> cloud-providers provider ->
+# worker environment. See resolve_placement_lib for why, and for the shape of
+# the provider's attributes.
+
+V_PROJECT=$(yaml_value "project_id" "" "$VALUES")
+V_REGION=$(yaml_value "region" "" "$VALUES")
+V_NETWORK=$(yaml_value "network" "" "$VALUES")
+V_TF_BUCKET=$(yaml_value "tfstate_bucket" "" "$VALUES")
+
+# A failure is not fatal: the values.yaml and environment tiers still apply.
+PLACEMENT_NRN=$(echo "${CONTEXT:-}" | jq -r '.service.nrn // .link.scope.nrn // .entity_nrn // ""' 2>/dev/null) || PLACEMENT_NRN=""
+
+PROVIDER_ATTRS='{}'
+if [ -n "$PLACEMENT_NRN" ]; then
+  # NOTE: --limit is incompatible with --categories (np rejects it). Do not add it.
+  PROVIDER_ATTRS=$(np provider list \
+    --nrn "$PLACEMENT_NRN" \
+    --categories cloud-providers \
+    --format json 2>/dev/null \
+    | jq -c '(.results // [])[0].attributes // {}' 2>/dev/null) || PROVIDER_ATTRS='{}'
+  [ -z "$PROVIDER_ATTRS" ] && PROVIDER_ATTRS='{}'
+fi
+
+PROJECT_ID=$(placement_project "$PROVIDER_ATTRS" "$V_PROJECT")
+REGION=$(placement_region "$PROVIDER_ATTRS" "$V_REGION")
+NETWORK_RAW=$(placement_network "$PROVIDER_ATTRS" "$V_NETWORK")
+TFSTATE_BUCKET=$(placement_tfstate_bucket "$PROVIDER_ATTRS" "$V_TF_BUCKET")
+
+if [ -z "$PROJECT_ID" ]; then
+  echo "ERROR: project_id is not set." >&2
+  echo "       Resolved from, in order: values.yaml, the cloud-providers provider" >&2
+  echo "       (.project.id), \$SERVICES_GCP_PROJECT, \$GOOGLE_CLOUD_PROJECT." >&2
+  exit 1
+fi
+
+if [[ ! "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+  echo "ERROR: invalid project_id '${PROJECT_ID}'" >&2
+  exit 1
+fi
+
+if [ -z "$TFSTATE_BUCKET" ]; then
+  echo "ERROR: tfstate_bucket is not set." >&2
+  echo "       Resolved from, in order: values.yaml, the cloud-providers provider" >&2
+  echo "       (.services.tfstate.bucket), \$SERVICES_TFSTATE_BUCKET." >&2
+  echo "       It must name an EXISTING GCS bucket; this service never creates one." >&2
+  exit 1
+fi
+
+if [[ ! "$TFSTATE_BUCKET" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]; then
+  echo "ERROR: invalid tfstate_bucket '${TFSTATE_BUCKET}'" >&2
+  exit 1
+fi
+
+# Region and network only matter to the actions that shape the instance; a
+# delete or a link reads everything else from state.
+if [ "$SERVICE_WRITE" = "true" ]; then
+  if [ -z "$REGION" ]; then
+    echo "ERROR: region is not set." >&2
+    echo "       Resolved from, in order: values.yaml, the cloud-providers provider" >&2
+    echo "       (.services.region), \$SERVICES_GCP_REGION." >&2
+    exit 1
+  fi
+  if [ -z "$NETWORK_RAW" ]; then
+    echo "ERROR: network is not set. The instance gets a private IP only, in this VPC." >&2
+    echo "       Resolved from, in order: values.yaml, the cloud-providers provider" >&2
+    echo "       (.services.network), \$SERVICES_GCP_NETWORK." >&2
+    exit 1
+  fi
+fi
+
+if [ -n "$REGION" ] && [[ ! "$REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]; then
+  echo "ERROR: invalid region '${REGION}' (expected a GCP region such as us-east1)" >&2
+  exit 1
+fi
+
+NETWORK=$(network_self_link "$PROJECT_ID" "$NETWORK_RAW")
+
+if [ -n "$NETWORK" ] && [[ ! "$NETWORK" =~ ^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/global/networks/[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+  echo "ERROR: invalid network '${NETWORK_RAW}' (expected a VPC name or projects/<p>/global/networks/<name>)" >&2
+  exit 1
+fi
+
+echo "GCP placement: project=${PROJECT_ID} region=${REGION:-<unset>} network=${NETWORK:-<unset>}"
+echo "   project: $(placement_source "$V_PROJECT" "$(provider_field "$PROVIDER_ATTRS" project.id)" "$(first_non_empty "${SERVICES_GCP_PROJECT:-}" "${GOOGLE_CLOUD_PROJECT:-}")")"
+echo "   region:  $(placement_source "$V_REGION" "$(provider_field "$PROVIDER_ATTRS" services.region)" "${SERVICES_GCP_REGION:-}")"
+echo "   network: $(placement_source "$V_NETWORK" "$(provider_field "$PROVIDER_ATTRS" services.network)" "${SERVICES_GCP_NETWORK:-}")"
+echo "Instance name: ${INSTANCE_NAME}"
+
+# --- tfstate location -------------------------------------------------------
+# A SHARED bucket with a per-service PREFIX, not a bucket per service, and not
+# a bucket this service creates: the install owns the bucket and the IAM on
+# it, so the worker needs object access only, never bucket creation.
+
+TFSTATE_PREFIX="cloud-sql-postgresql/${SERVICE_ID}/deployment"
+
+echo "tfstate: gs://${TFSTATE_BUCKET}/${TFSTATE_PREFIX}"
+
+# --- Terraform execution environment ---------------------------------------
+
+OUTPUT_DIR="/tmp/np-service-${SERVICE_ID}"
+mkdir -p "$OUTPUT_DIR"
+
+TOFU_MODULE_DIR="$SERVICE_PATH/deployment"
+
+# The backend settings go in a FILE, not in a string of -backend-config flags:
+# a flag string has to survive the workflow engine's environment channel
+# intact and then be word-split back into argv, and one added quote turns a
+# flag into a positional argument.
+cat > "${OUTPUT_DIR}/backend.hcl" <<EOF
+bucket = "${TFSTATE_BUCKET}"
+prefix = "${TFSTATE_PREFIX}"
+EOF
+
+TOFU_INIT_VARIABLES=""
+
+# GCP label keys and values: lowercase letters, digits, "_" and "-", up to 63,
+# and a key must start with a letter.
+LABELS=$(echo "$CONTEXT" | jq -c '.tags // {}
+  | with_entries(
+      .key   |= (ascii_downcase | gsub("[^a-z0-9_-]"; "_") | .[0:63])
+    | .value |= (tostring | ascii_downcase | gsub("[^a-z0-9_-]"; "_") | .[0:63]))
+  | with_entries(select(.key | test("^[a-z]")))')
+
+TOFU_VARIABLES=$(jq -nc \
+  --arg     service_id            "$SERVICE_ID" \
+  --arg     instance_name         "$INSTANCE_NAME" \
+  --arg     project_id            "$PROJECT_ID" \
+  --arg     region                "$REGION" \
+  --arg     network               "$NETWORK" \
+  --arg     database_name         "$DATABASE_NAME" \
+  --arg     postgres_version      "$POSTGRES_VERSION" \
+  --arg     tier                  "$TIER" \
+  --argjson disk_size_gb          "$DISK_SIZE_GB" \
+  --argjson backup_retention_days "$BACKUP_RETENTION_DAYS" \
+  --argjson high_availability     "$HIGH_AVAILABILITY" \
+  --argjson labels                "$LABELS" \
+  '{
+    service_id:            $service_id,
+    instance_name:         $instance_name,
+    project_id:            $project_id,
+    region:                $region,
+    network:               $network,
+    database_name:         $database_name,
+    postgres_version:      $postgres_version,
+    tier:                  $tier,
+    disk_size_gb:          $disk_size_gb,
+    backup_retention_days: $backup_retention_days,
+    high_availability:     $high_availability,
+    labels:                $labels
+  }')
+
+export SERVICE_ID SERVICE_NAME INSTANCE_NAME DATABASE_NAME
+export PROJECT_ID REGION NETWORK
+export TFSTATE_BUCKET TFSTATE_PREFIX
+export OUTPUT_DIR TOFU_MODULE_DIR TOFU_INIT_VARIABLES TOFU_VARIABLES
+
+# --- Link context (link workflows only) ------------------------------------
+# Consumed by build_permissions_context in the next step. Every field comes
+# from the notification payload; never call the API to resolve slugs or NRNs.
+
+if [ "${ACTION_SOURCE:-}" = "link" ]; then
+  LINK_ID=$(echo "$CONTEXT"   | jq -r '.link.id        // ""')
+  LINK_NAME=$(echo "$CONTEXT" | jq -r '.link.name      // .link.slug // ""')
+  SCOPE_ID=$(echo "$CONTEXT"  | jq -r '.link.scope.id  // .tags.scope_id // ""')
+  SCOPE_NRN=$(echo "$CONTEXT" | jq -r '.link.scope.nrn // ""')
+  SCOPE_SLUG=$(echo "$CONTEXT" | jq -r '.link.scope.slug // .tags.scope // ""')
+  APP_SLUG=$(echo "$CONTEXT"  | jq -r '.link.entity.slug // .tags.application // ""')
+  APP_NRN=$(echo "$CONTEXT"   | jq -r '.link.entity.nrn  // ""')
+
+  LINK_ATTRS=$(echo "$CONTEXT" | jq -c '(.link.attributes // {}) * (.parameters // {})')
+
+  LINK_ACCESS_LEVEL=$(echo "$LINK_ATTRS" | jq -r '.access_level // "admin"')
+
+  if [[ ! "$LINK_ACCESS_LEVEL" =~ ^(read|read-write|admin)$ ]]; then
+    echo "ERROR: invalid access_level '${LINK_ACCESS_LEVEL}' (expected read, read-write or admin)" >&2
+    exit 1
+  fi
+
+  # The role name must be STABLE once created: postgresql_role forces
+  # replacement on a rename, which would drop the role and the grants the
+  # application is using. A stored username always wins; the fallback derives
+  # one from the application slug and the link id on the very first link.
+  STORED_USERNAME=$(echo "$LINK_ATTRS" | jq -r '.username // ""')
+
+  if [ -n "$STORED_USERNAME" ]; then
+    LINK_USERNAME="$STORED_USERNAME"
+  elif [ -n "$LINK_ID" ]; then
+    _app=$(printf '%s' "$APP_SLUG" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '_' | tr -s '_' | sed 's/^_//; s/_$//' | cut -c1-40)
+    _lid=$(printf '%s' "$LINK_ID" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-8)
+    LINK_USERNAME="u_${_app:-app}_${_lid}"
+  else
+    LINK_USERNAME=""
+  fi
+
+  if [ -n "$LINK_USERNAME" ] && [[ ! "$LINK_USERNAME" =~ ^[a-z][a-z0-9_]{2,62}$ ]]; then
+    echo "ERROR: username '${LINK_USERNAME}' is not a valid PostgreSQL role name for this service" >&2
+    echo "       (required: 3-63 lowercase letters, digits and underscores, starting with a letter)" >&2
+    exit 1
+  fi
+
+  export LINK_ID LINK_NAME SCOPE_ID SCOPE_NRN SCOPE_SLUG APP_SLUG APP_NRN
+  export LINK_ACCESS_LEVEL LINK_USERNAME
+fi

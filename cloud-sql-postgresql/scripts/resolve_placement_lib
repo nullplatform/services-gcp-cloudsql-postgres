@@ -1,0 +1,122 @@
+#!/bin/bash
+# Sourceable library of PURE helpers for resolving WHERE this service puts
+# things: the target project, region and VPC network, and the tfstate bucket.
+# Makes NO np/gcloud calls and has no source side effects — fully
+# unit-testable.
+#
+# Requires (at call time): jq.
+#
+# ---------------------------------------------------------------------------
+# Why these values have three sources
+#
+# Same model as services-postgresql-flexible-server. Placement is
+# configuration, resolved per field from the most platform-native source
+# available, in this order:
+#
+#   1. values.yaml   explicit, service-scoped, committed operator configuration
+#   2. provider      the cloud-providers config for this NRN + dimensions
+#   3. environment   what the worker pod receives from the agent install
+#
+# The project is the one value the GCP provider already carries: tofu-modules'
+# nullplatform/cloud/gcp/cloud publishes `project.id` on the
+# google-cloud-configuration provider, so a stock install configures it once,
+# there. Region, network and the tfstate bucket have no field in that schema;
+# they are read from a `services` block when an operator publishes one, and
+# otherwise from the worker's environment (see the README, "How to register").
+# ---------------------------------------------------------------------------
+
+# first_non_empty <val>...
+# Echoes the first argument that is not the empty string. Echoes nothing when
+# they are all empty. This is the whole precedence mechanism.
+first_non_empty() {
+  local v
+  for v in "$@"; do
+    if [ -n "$v" ]; then
+      printf '%s' "$v"
+      return 0
+    fi
+  done
+}
+
+# provider_field <provider_attributes_json> <jq_path>
+# Echoes a single string field, or empty. Never crashes on empty or malformed
+# input; a non-string (object, array, null) reads as empty rather than as
+# jq's rendering of it.
+provider_field() {
+  local json="${1:-}" path="${2:-}"
+  [ -z "$json" ] && return 0
+  [ -z "$path" ] && return 0
+  printf '%s' "$json" \
+    | jq -r --arg p "$path" 'getpath($p | split(".")) | if type == "string" then . else "" end' 2>/dev/null \
+    || true
+}
+
+# Shape of the cloud-providers attributes this service reads. `project.id`
+# is what tofu-modules publishes; the `services` block is optional:
+#
+#   {
+#     "project":  { "id": "my-project" },
+#     "services": {
+#       "region":  "us-east1",
+#       "network": "projects/my-project/global/networks/my-vpc",
+#       "tfstate": { "bucket": "my-project-np-services-tfstate" }
+#     }
+#   }
+
+placement_project() {
+  local provider_json="${1:-}" from_values="${2:-}"
+  first_non_empty \
+    "$from_values" \
+    "$(provider_field "$provider_json" "project.id")" \
+    "${SERVICES_GCP_PROJECT:-}" \
+    "${GOOGLE_CLOUD_PROJECT:-}"
+}
+
+placement_region() {
+  local provider_json="${1:-}" from_values="${2:-}"
+  first_non_empty \
+    "$from_values" \
+    "$(provider_field "$provider_json" "services.region")" \
+    "${SERVICES_GCP_REGION:-}"
+}
+
+placement_network() {
+  local provider_json="${1:-}" from_values="${2:-}"
+  first_non_empty \
+    "$from_values" \
+    "$(provider_field "$provider_json" "services.network")" \
+    "${SERVICES_GCP_NETWORK:-}"
+}
+
+placement_tfstate_bucket() {
+  local provider_json="${1:-}" from_values="${2:-}"
+  first_non_empty \
+    "$from_values" \
+    "$(provider_field "$provider_json" "services.tfstate.bucket")" \
+    "${SERVICES_TFSTATE_BUCKET:-}"
+}
+
+# network_self_link <project> <network>
+# Accepts a bare VPC name or any self link and echoes the
+# projects/<p>/global/networks/<n> form Cloud SQL's private_network expects.
+# A bare name is taken to live in the target project.
+network_self_link() {
+  local project="${1:-}" network="${2:-}"
+  [ -z "$network" ] && return 0
+  case "$network" in
+    projects/*)   printf '%s' "$network" ;;
+    */projects/*) printf '%s' "projects/${network#*/projects/}" ;;
+    *)            printf 'projects/%s/global/networks/%s' "$project" "$network" ;;
+  esac
+}
+
+# placement_source <values_val> <provider_val> <env_val>
+# Echoes which tier supplied a value, for logging. Never echoes the value.
+placement_source() {
+  local v="${1:-}" p="${2:-}" e="${3:-}"
+  if   [ -n "$v" ]; then printf 'values.yaml'
+  elif [ -n "$p" ]; then printf 'provider'
+  elif [ -n "$e" ]; then printf 'worker-environment'
+  else printf 'unset'
+  fi
+}

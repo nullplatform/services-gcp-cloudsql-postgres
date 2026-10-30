@@ -1,0 +1,75 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# instance_name — Derives a valid Cloud SQL instance name.
+#
+# Cloud SQL's constraint: lowercase letters, digits and hyphens, starting with
+# a letter, no trailing hyphen, unique within the project. A deleted
+# instance's name stays reserved for up to a week, which the service-id
+# suffix makes irrelevant: a new service instance never reuses one.
+#
+# Usage: instance_name <raw_name> <service_id>
+#
+# Capped at 63 characters, well under Cloud SQL's limit, so the name also
+# fits in labels. The service-id suffix is always preserved: when the name is
+# too long the BASE is truncated, never the suffix, so uniqueness survives
+# truncation.
+# ---------------------------------------------------------------------------
+
+RAW_NAME="${1:-}"
+SERVICE_ID="${2:-}"
+
+if [ -z "$SERVICE_ID" ]; then
+  echo "ERROR: instance_name requires <raw_name> <service_id>" >&2
+  exit 1
+fi
+
+MAX_LEN=63
+FALLBACK_BASE="nppg"
+
+# Lowercase, anything that is not [a-z0-9] becomes a hyphen, hyphen runs
+# collapse to one, leading and trailing hyphens go.
+sanitize() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9\n' '-' \
+    | tr -s '-' \
+    | sed 's/^-//; s/-$//'
+}
+
+SUFFIX=$(printf '%s' "$SERVICE_ID" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-8)
+
+if [ -z "$SUFFIX" ]; then
+  echo "ERROR: service_id '${SERVICE_ID}' contains no alphanumeric characters" >&2
+  exit 1
+fi
+
+BASE=$(sanitize "$RAW_NAME")
+
+# .service.name may be absent or sanitize to nothing — the fallback keeps the
+# name from being just the suffix.
+if [ -z "$BASE" ]; then
+  BASE="$FALLBACK_BASE"
+fi
+
+# Cloud SQL names must start with a letter; a service called "2024-db" would
+# otherwise produce an invalid name.
+case "$BASE" in
+  [a-z]*) ;;
+  *) BASE="${FALLBACK_BASE}-${BASE}" ;;
+esac
+
+# Room for the base: total minus the suffix minus the joining hyphen.
+AVAILABLE=$((MAX_LEN - ${#SUFFIX} - 1))
+BASE=$(printf '%s' "$BASE" | cut -c1-"$AVAILABLE" | sed 's/-$//')
+
+NAME="${BASE}-${SUFFIX}"
+
+if [[ ! "$NAME" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+  echo "ERROR: computed instance name '${NAME}' is not a valid Cloud SQL instance name" >&2
+  echo "       (required: up to 63 lowercase letters, digits and hyphens, starting with a letter, no trailing hyphen)" >&2
+  exit 1
+fi
+
+printf '%s\n' "$NAME"
