@@ -94,6 +94,17 @@ while read -r o; do
   assert_contains " $OUTS " " $o " "output $o, read by the permissions module, exists"
 done < <(grep -ho 'local\.server\.[a-z_]*' "$SERVICE_PATH"/permissions/*.tf | sed 's/^local\.server\.//' | sort -u)
 
+echo "== audit logging flags (trivy GCP-0014/0016/0020/0022/0025) =="
+# flag_value <name>: the value of the database_flags block with that name.
+flag_value() {
+  grep -A1 "name  = \"$1\"" "$MODULE/main.tf" | sed -n 's/.*value = "\(.*\)"/\1/p' | head -1
+}
+for f in log_checkpoints log_connections log_disconnections log_lock_waits; do
+  assert_eq "on" "$(flag_value "$f")" "flag $f is on"
+done
+assert_eq "0" "$(flag_value log_temp_files)" "log_temp_files logs every temporary file"
+assert_eq "absent" "$(grep -q 'dynamic "database_flags"' "$MODULE/main.tf" && echo present || echo absent)" "flags are literal blocks, which static scanners can read"
+
 echo "== backend is static, gcs, and unconfigured =="
 assert_eq "present" "$(grep -q 'backend "gcs" {}' "$MODULE/backend.tf" && echo present || echo absent)" "empty gcs backend declared in backend.tf"
 assert_eq "present" "$(grep -q 'hashicorp/google' "$MODULE/providers.tf" && echo present || echo absent)" "google provider declared"

@@ -80,6 +80,32 @@ resource "google_sql_database_instance" "instance" {
         retention_unit   = "COUNT"
       }
     }
+
+    # Audit logging the CIS benchmark asks for (trivy GCP-0014/0016/0020/0022/0025).
+    # The logs go to Cloud Logging. These are dynamic PostgreSQL settings, so
+    # Cloud SQL applies them without a restart. Literal blocks rather than a
+    # dynamic one: static scanners do not expand a dynamic block over locals.
+    database_flags {
+      name  = "log_checkpoints"
+      value = "on"
+    }
+    database_flags {
+      name  = "log_connections"
+      value = "on"
+    }
+    database_flags {
+      name  = "log_disconnections"
+      value = "on"
+    }
+    database_flags {
+      name  = "log_lock_waits"
+      value = "on"
+    }
+    # 0 logs every temporary file, whatever its size.
+    database_flags {
+      name  = "log_temp_files"
+      value = "0"
+    }
   }
 }
 
