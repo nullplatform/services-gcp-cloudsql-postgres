@@ -1,0 +1,25 @@
+# Trivy suppressions for this repo (intentional, documented). Each ID appears in
+# both forms: the AVD- prefix older Trivy versions report and the bare ID newer
+# ones do.
+
+# GCP-0066 (tfstate bucket without a customer-managed encryption key), in
+# specs/requirements/gcp: the bucket uses Google-managed encryption. A CMEK
+# needs a KMS key ring and key that the installation owns and rotates, which
+# this module cannot create on its own. Access is what protects the state
+# (uniform bucket-level access, public access prevention, object admin only
+# for the worker's principal), as the README's "The tfstate is a credential
+# store" section says.
+AVD-GCP-0066
+GCP-0066
+
+# DS-0026 (no HEALTHCHECK in the Dockerfile): the image runs as an ephemeral
+# worker pod that the nullplatform agent starts, talks to and reaps; there is
+# no long-lived server in it to probe, and Kubernetes ignores Docker
+# HEALTHCHECK anyway.
+AVD-DS-0026
+DS-0026
+
+# Not suppressed on purpose: the Go CVEs in usr/local/bin/tofu. They are in
+# libraries compiled into the OpenTofu release binary (go-jose, x/mod, x/net,
+# grpc) and go away only with a newer OpenTofu release; keep them visible so a
+# TOFU_VERSION bump is the reminder.
