@@ -340,6 +340,26 @@ holds its role's password. **Anyone with read access to the tfstate bucket
 holds every credential this service has issued.** Use a dedicated bucket and
 treat it like a vault.
 
+### The worker's identity reaches the whole project
+
+`roles/cloudsql.admin` is granted on the project, and the Kubernetes service
+account it goes to is the agent's own, which every worker the agent runs
+shares. Whatever runs as that identity can delete, export or reset the
+password of **any** Cloud SQL instance in the project, not only the ones this
+service created, and can read or rewrite any state in the tfstate bucket.
+Install the service in a project that holds only the instances it manages,
+with a bucket of its own (`specs/requirements/gcp` creates one with uniform
+bucket-level access, public access prevention and versioning), and keep other
+databases elsewhere. Narrowing the grant with IAM Conditions on instance name
+and object prefix is possible, but not implemented here.
+
+The service guards its own side: `instance_name` and the link `username` are
+read only from stored attributes, never from action parameters; link roles
+must start with `u_`, so a link can never manage the administrator or a
+Cloud SQL built-in role; and once an instance exists, its project and region
+are pinned to the stored values, so a configuration change cannot move it
+(which would destroy it).
+
 ### Creation takes minutes
 
 Cloud SQL provisions an instance in roughly five to fifteen minutes. The
