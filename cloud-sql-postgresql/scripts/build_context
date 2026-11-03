@@ -58,6 +58,13 @@ if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
   exit 1
 fi
 
+# The id becomes a path segment (OUTPUT_DIR, the tfstate prefix) and is
+# written into backend.hcl, so anything beyond an identifier is refused.
+if [[ ! "$SERVICE_ID" =~ ^[A-Za-z0-9-]+$ ]]; then
+  echo "ERROR: invalid .service.id '${SERVICE_ID}' (expected letters, digits and hyphens)" >&2
+  exit 1
+fi
+
 # --- Merge stored attributes with this action's parameters ------------------
 # CRITICAL: on the first "create", .service.attributes is empty or incomplete;
 # user-supplied values arrive in .parameters. jq's * merges objects with the
@@ -72,7 +79,12 @@ SERVICE_ATTRS=$(echo "$CONTEXT" | jq -c '(.service.attributes // {}) * (.paramet
 # service instance in nullplatform computes a different name on the next
 # "update" — and "name" forces replacement on google_sql_database_instance,
 # destroying the instance and every database in it.
-STORED_INSTANCE_NAME=$(echo "$SERVICE_ATTRS" | jq -r '.instance_name // ""')
+#
+# Read from the stored attributes only, never from the merge above: a caller
+# that sent instance_name in .parameters would otherwise retarget the apply at
+# another instance, and the name change alone destroys this one.
+STORED_ATTRS=$(echo "$CONTEXT" | jq -c '.service.attributes // {}')
+STORED_INSTANCE_NAME=$(echo "$STORED_ATTRS" | jq -r '.instance_name // ""')
 
 if [ -n "$STORED_INSTANCE_NAME" ]; then
   INSTANCE_NAME="$STORED_INSTANCE_NAME"
@@ -160,12 +172,22 @@ V_TF_BUCKET=$(yaml_value "tfstate_bucket" "" "$VALUES")
 # A failure is not fatal: the values.yaml and environment tiers still apply.
 PLACEMENT_NRN=$(echo "${CONTEXT:-}" | jq -r '.service.nrn // .link.scope.nrn // .entity_nrn // ""' 2>/dev/null) || PLACEMENT_NRN=""
 
+# Dimensions as key:value,key:value so np resolves the most specific provider:
+# without them, an account with one GCP config per environment hands every
+# service the first one, whatever its environment.
+PLACEMENT_DIMENSIONS=$(echo "${CONTEXT:-}" | jq -r '
+  (.service.dimensions // .link.dimensions // {})
+  | if type == "object" and length > 0
+    then [ to_entries[] | "\(.key):\(.value)" ] | join(",")
+    else empty end' 2>/dev/null) || PLACEMENT_DIMENSIONS=""
+
 PROVIDER_ATTRS='{}'
 if [ -n "$PLACEMENT_NRN" ]; then
   # NOTE: --limit is incompatible with --categories (np rejects it). Do not add it.
   PROVIDER_ATTRS=$(np provider list \
     --nrn "$PLACEMENT_NRN" \
     --categories cloud-providers \
+    ${PLACEMENT_DIMENSIONS:+--dimensions "$PLACEMENT_DIMENSIONS"} \
     --format json 2>/dev/null \
     | jq -c '(.results // [])[0].attributes // {}' 2>/dev/null) || PROVIDER_ATTRS='{}'
   [ -z "$PROVIDER_ATTRS" ] && PROVIDER_ATTRS='{}'
@@ -175,6 +197,30 @@ PROJECT_ID=$(placement_project "$PROVIDER_ATTRS" "$V_PROJECT")
 REGION=$(placement_region "$PROVIDER_ATTRS" "$V_REGION")
 NETWORK_RAW=$(placement_network "$PROVIDER_ATTRS" "$V_NETWORK")
 TFSTATE_BUCKET=$(placement_tfstate_bucket "$PROVIDER_ATTRS" "$V_TF_BUCKET")
+
+# --- Project and region are pinned once the instance exists ------------------
+# Both force replacement on google_sql_database_instance. Re-resolving them on
+# every action would let a configuration change (a new region on the provider,
+# another project in values.yaml) destroy the instance on the next update and
+# recreate it empty elsewhere. The stored project_id and the region inside the
+# stored connection_name (<project>:<region>:<instance>) win, as instance_name
+# does.
+STORED_PROJECT_ID=$(echo "$STORED_ATTRS" | jq -r '.project_id // ""')
+STORED_REGION=$(echo "$STORED_ATTRS" | jq -r '.connection_name // "" | split(":") | if length == 3 then .[1] else "" end')
+
+if [ -n "$STORED_PROJECT_ID" ]; then
+  if [ -n "$PROJECT_ID" ] && [ "$PROJECT_ID" != "$STORED_PROJECT_ID" ]; then
+    echo "WARNING: the configuration now resolves project '${PROJECT_ID}', but the instance lives in '${STORED_PROJECT_ID}'. Keeping '${STORED_PROJECT_ID}': moving it would destroy the instance." >&2
+  fi
+  PROJECT_ID="$STORED_PROJECT_ID"
+fi
+
+if [ -n "$STORED_REGION" ]; then
+  if [ -n "$REGION" ] && [ "$REGION" != "$STORED_REGION" ]; then
+    echo "WARNING: the configuration now resolves region '${REGION}', but the instance lives in '${STORED_REGION}'. Keeping '${STORED_REGION}': moving it would destroy the instance." >&2
+  fi
+  REGION="$STORED_REGION"
+fi
 
 if [ -z "$PROJECT_ID" ]; then
   echo "ERROR: project_id is not set." >&2
@@ -333,6 +379,13 @@ if [ "${ACTION_SOURCE:-}" = "link" ]; then
   APP_SLUG=$(echo "$CONTEXT"  | jq -r '.link.entity.slug // .tags.application // ""')
   APP_NRN=$(echo "$CONTEXT"   | jq -r '.link.entity.nrn  // ""')
 
+  # Same rule as .service.id: the link id becomes a path segment and a state
+  # prefix.
+  if [ -n "$LINK_ID" ] && [[ ! "$LINK_ID" =~ ^[A-Za-z0-9-]+$ ]]; then
+    echo "ERROR: invalid .link.id '${LINK_ID}' (expected letters, digits and hyphens)" >&2
+    exit 1
+  fi
+
   LINK_ATTRS=$(echo "$CONTEXT" | jq -c '(.link.attributes // {}) * (.parameters // {})')
 
   LINK_ACCESS_LEVEL=$(echo "$LINK_ATTRS" | jq -r '.access_level // "admin"')
@@ -346,7 +399,11 @@ if [ "${ACTION_SOURCE:-}" = "link" ]; then
   # replacement on a rename, which would drop the role and the grants the
   # application is using. A stored username always wins; the fallback derives
   # one from the application slug and the link id on the very first link.
-  STORED_USERNAME=$(echo "$LINK_ATTRS" | jq -r '.username // ""')
+  #
+  # Read from the stored link attributes only, never from .parameters: a
+  # caller-supplied username could name the administrator or another link's
+  # role, and the apply would then manage (and on unlink drop) that role.
+  STORED_USERNAME=$(echo "$CONTEXT" | jq -r '.link.attributes.username // ""')
 
   if [ -n "$STORED_USERNAME" ]; then
     LINK_USERNAME="$STORED_USERNAME"
@@ -358,9 +415,11 @@ if [ "${ACTION_SOURCE:-}" = "link" ]; then
     LINK_USERNAME=""
   fi
 
-  if [ -n "$LINK_USERNAME" ] && [[ ! "$LINK_USERNAME" =~ ^[a-z][a-z0-9_]{2,62}$ ]]; then
+  # Every role this service issues starts with u_; the administrator, the
+  # Cloud SQL built-ins (postgres, cloudsql*) and anything else do not.
+  if [ -n "$LINK_USERNAME" ] && [[ ! "$LINK_USERNAME" =~ ^u_[a-z0-9_]{1,61}$ ]]; then
     echo "ERROR: username '${LINK_USERNAME}' is not a valid PostgreSQL role name for this service" >&2
-    echo "       (required: 3-63 lowercase letters, digits and underscores, starting with a letter)" >&2
+    echo "       (required: u_ followed by 1-61 lowercase letters, digits and underscores)" >&2
     exit 1
   fi
 

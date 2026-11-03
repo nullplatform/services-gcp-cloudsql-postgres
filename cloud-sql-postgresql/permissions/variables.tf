@@ -13,8 +13,8 @@ variable "username" {
   description = "PostgreSQL role to create for this link, precomputed by build_context and stable across updates"
 
   validation {
-    condition     = can(regex("^[a-z][a-z0-9_]{2,62}$", var.username))
-    error_message = "username must be 3-63 lowercase letters, digits and underscores, starting with a letter."
+    condition     = can(regex("^u_[a-z0-9_]{1,61}$", var.username))
+    error_message = "username must be u_ followed by 1-61 lowercase letters, digits and underscores: the prefix keeps a link from ever managing the administrator or a Cloud SQL built-in role."
   }
 }
 

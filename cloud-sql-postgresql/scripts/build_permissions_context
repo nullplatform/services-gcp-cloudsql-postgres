@@ -66,9 +66,9 @@ if [ -z "$USERNAME" ]; then
   exit 1
 fi
 
-if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_]{2,62}$ ]]; then
+if [[ ! "$USERNAME" =~ ^u_[a-z0-9_]{1,61}$ ]]; then
   echo "ERROR: invalid username '${USERNAME}'" >&2
-  echo "       (required: 3-63 lowercase letters, digits and underscores, starting with a letter)" >&2
+  echo "       (required: u_ followed by 1-61 lowercase letters, digits and underscores)" >&2
   exit 1
 fi
 

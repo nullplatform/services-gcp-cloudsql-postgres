@@ -403,4 +403,47 @@ for level in read read-write admin; do
   assert_eq "$level" "$(get "$LVL" LINK_ACCESS_LEVEL)" "access_level $level accepted"
 done
 
+echo "== a username in .parameters never overrides the stored or derived one =="
+PARAM_USER=$(run_bc "$TMP/values.yaml" "$(ctx link.json '.parameters.username = "npadmin"')")
+assert_eq "u_conciliation_api_eeeeeeee" "$(get "$PARAM_USER" LINK_USERNAME)" "parameters.username ignored on a new link"
+PARAM_USER2=$(run_bc "$TMP/values.yaml" "$(ctx link.json '.type = "update" | .link.attributes = {"username":"u_kept_role"} | .parameters.username = "u_other_link_role"')")
+assert_eq "u_kept_role" "$(get "$PARAM_USER2" LINK_USERNAME)" "parameters.username ignored on an update"
+
+echo "== only u_ roles are ever managed, so a link cannot take over a built-in role =="
+for reserved in npadmin postgres cloudsqlsuperuser; do
+  expect_reject "stored username $reserved rejected" "$TMP/values.yaml" "$(ctx link.json ".type = \"update\" | .link.attributes = {\"username\":\"$reserved\"}")"
+done
+
+echo "== an instance_name in .parameters never retargets the instance =="
+PARAM_INST=$(run_bc "$TMP/values.yaml" "$(ctx create.json '.type = "update" | .service.attributes = {"database_name":"conciliation","instance_name":"conciliation-db-9f8e7d6c"} | .parameters.instance_name = "victim-prod-db"')")
+assert_eq "conciliation-db-9f8e7d6c" "$(get "$PARAM_INST" INSTANCE_NAME)" "stored instance_name kept"
+PARAM_INST2=$(run_bc "$TMP/values.yaml" "$(ctx create.json '.parameters.instance_name = "victim-prod-db"')")
+assert_eq "conciliation-db-9f8e7d6c" "$(get "$PARAM_INST2" INSTANCE_NAME)" "a create derives the name, ignoring parameters"
+
+echo "== service and link ids must be identifiers =="
+expect_reject "service id with a path rejected" "$TMP/values.yaml" "$(ctx create.json '.service.id = "../../tmp/x"')"
+expect_reject "service id with a quote and newline rejected" "$TMP/values.yaml" "$(ctx create.json '.service.id = "abc\"\nimpersonate_service_account = \"x"')"
+expect_reject "link id with a path rejected" "$TMP/values.yaml" "$(ctx link.json '.link.id = "../x"')"
+
+echo "== the provider lookup passes the service's dimensions =="
+: > "$TMP/np.log"
+run_bc "$TMP/values.yaml" "$(ctx create.json)" >/dev/null
+assert_contains "$(grep 'provider list' "$TMP/np.log" | tail -1)" "--dimensions environment:development" "create passes .service.dimensions"
+: > "$TMP/np.log"
+run_bc "$TMP/values.yaml" "$(ctx create.json 'del(.service.dimensions)')" >/dev/null
+if grep 'provider list' "$TMP/np.log" | grep -q -- '--dimensions'; then
+  echo "  FAIL --dimensions passed with no dimensions" >&2; FAILURES=$((FAILURES + 1))
+else
+  echo "  ok   no --dimensions flag when the service has none"
+fi
+
+echo "== project and region are pinned to the stored instance =="
+PINNED=$(run_bc "$TMP/values.yaml" "$(ctx create.json '.type = "update" | .service.attributes = {"database_name":"conciliation","instance_name":"conciliation-db-9f8e7d6c","project_id":"np-services-old","connection_name":"np-services-old:us-central1:conciliation-db-9f8e7d6c"}')")
+assert_eq "np-services-old" "$(get "$PINNED" PROJECT_ID)" "stored project_id wins over values.yaml"
+assert_eq "us-central1" "$(get "$PINNED" REGION)" "region from the stored connection_name wins"
+assert_contains "$(cat "$TMP/bc.out")" "WARNING: the configuration now resolves region 'us-east1'" "the drift is reported"
+assert_eq "np-services-old" "$(get "$PINNED" TOFU_VARIABLES | jq -r .project_id)" "tfvars carry the pinned project"
+FRESH=$(run_bc "$TMP/values.yaml" "$(ctx create.json)")
+assert_eq "np-services-test" "$(get "$FRESH" PROJECT_ID)" "a first create still resolves the configured project"
+
 finish_tests
