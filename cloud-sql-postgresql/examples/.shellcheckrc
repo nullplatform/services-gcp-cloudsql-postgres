@@ -1,0 +1,4 @@
+# The tests isolate every case in a subshell on purpose, so variables set
+# there are meant to stay there (SC2030, SC2031). Literal "$" in grep and
+# sed patterns is intentional too (SC2016): they match shell source text.
+disable=SC2016,SC2030,SC2031

@@ -1,0 +1,47 @@
+# GCP Cloud SQL PostgreSQL Service — Static Configuration
+#
+# These values are NOT exposed in the nullplatform UI.
+#
+# EVERY KEY HERE IS OPTIONAL. It is the highest-precedence tier of a
+# three-tier resolution, meant for overriding, not for configuring:
+#
+#   1. values.yaml (this file)   explicit, service-scoped, committed
+#   2. cloud-providers provider  the platform's own configuration for this
+#                                NRN + dimensions
+#   3. worker environment        what the agent install hands the worker pod
+#
+# It outranks the other two on purpose: setting a key here pins it, whatever
+# the provider or the pod environment say.
+#
+# NOTE: In scripts, $VALUES is a FILE PATH (set by
+#       "np service workflow exec --values <path>"). It is NOT JSON content.
+#       Read values with yaml_value(), never with jq.
+#
+# NEVER put a secret in this file — it is committed. There is no credential
+# to configure anyway: the worker authenticates to GCP as the agent's
+# Kubernetes service account, through Workload Identity Federation.
+
+# --- GCP placement ----------------------------------------------------------
+# project_id: otherwise from the provider's .project.id — which
+#   tofu-modules' nullplatform/cloud/gcp/cloud already publishes — then
+#   $SERVICES_GCP_PROJECT, then $GOOGLE_CLOUD_PROJECT.
+#
+# region: otherwise from the provider's .services.region, then
+#   $SERVICES_GCP_REGION.
+#
+# network: the VPC the instance gets its private IP in, as a bare name (taken
+#   to live in project_id) or projects/<p>/global/networks/<name>. It must
+#   have Private Service Access configured, and it must be the VPC the agent's
+#   cluster runs in. Otherwise from the provider's .services.network, then
+#   $SERVICES_GCP_NETWORK.
+project_id: ""
+region: ""
+network: ""
+
+# --- Terraform state --------------------------------------------------------
+# An EXISTING GCS bucket. This service never creates one: it writes under
+# cloud-sql-postgresql/<service_id>/.
+#
+# Otherwise from the provider's .services.tfstate.bucket, then
+# $SERVICES_TFSTATE_BUCKET.
+tfstate_bucket: ""
