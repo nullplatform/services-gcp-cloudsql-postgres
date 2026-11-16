@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/nullplatform/services-gcp-cloudsql-postgres/compare/v1.0.0...v1.0.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **deps:** update dependency opentofu/opentofu to v1.13.9 ([#5](https://github.com/nullplatform/services-gcp-cloudsql-postgres/issues/5)) ([632de39](https://github.com/nullplatform/services-gcp-cloudsql-postgres/commit/632de394ffd24f9f871c4041cacdc52765086803))
+
 ## 1.0.0 (2026-11-05)
 
 
