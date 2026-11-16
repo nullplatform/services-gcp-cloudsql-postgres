@@ -4,7 +4,7 @@ FROM public.ecr.aws/nullplatform/scopes/worker-bridge:2.0.7
 
 # OpenTofu, pinned, so no action downloads it at runtime. Keep TOFU_VERSION in
 # sync with .github/workflows/terraform.yml and with scripts/do_tofu's fallback.
-ARG TOFU_VERSION=1.13.2
+ARG TOFU_VERSION=1.13.9
 # The tarballs' SHA-256, from the release's tofu_<version>_SHA256SUMS. Pinned
 # here rather than fetched with the tarball, so a tampered release fails the
 # build. Update both with TOFU_VERSION.
