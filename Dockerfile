@@ -8,8 +8,8 @@ ARG TOFU_VERSION=1.13.9
 # The tarballs' SHA-256, from the release's tofu_<version>_SHA256SUMS. Pinned
 # here rather than fetched with the tarball, so a tampered release fails the
 # build. Update both with TOFU_VERSION.
-ARG TOFU_SHA256_AMD64=ac05d9952662c7db28dd57e93f0a68018837bfdf9342384ec0987977c16a9645
-ARG TOFU_SHA256_ARM64=88e2d9e3f94f97b76ab2faf55ade87578f56aed19c5e45fa139d70e994366d1f
+ARG TOFU_SHA256_AMD64=b34b327cc1ef07178207b6f2cd1f5276537d3e5b7be316500f6dac50d4c0a857
+ARG TOFU_SHA256_ARM64=5dc196dde75b667e4806d358310ec96742774cd0993c54c1237efee5644b69b8
 # TARGETARCH is a BuildKit built-in and is empty under the legacy builder.
 ARG TARGETARCH
 RUN set -eu; \
