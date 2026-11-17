@@ -216,6 +216,8 @@ The service is published once as the package `np-gcp-cloud-sql-postgresql` (spec
 
 How installing a package works, how it coexists with a copy you registered, how to upgrade, and when to fork instead are in the [package installation guide](https://docs.nullplatform.com/docs/packages/install); this section has what is specific to this service.
 
+Already registered a copy from the former `cloud-sql-postgresql/specs/install`? It keeps working: it called tofu-modules' `service_definition` on specs that stay in every release, and the package installs next to it, as the guide explains. If you sourced that directory as a module, pin its `?ref` to a release that still has it.
+
 Installing it touches three layers: the GCP side, the agent, which runs the worker with its placement, and the nullplatform layer.
 
 | Layer | What | Module |
