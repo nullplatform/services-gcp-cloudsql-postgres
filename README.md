@@ -264,8 +264,7 @@ module "cloud_sql_requirements" {
   }
 
 # ── nullplatform layer ───────────────────────────────────────────────
-# The same module a catalog entry with `install_package` becomes. For a
-# service the installation is the whole nullplatform side, channel included.
+# For a service the installation is the whole nullplatform side, channel included.
 module "cloud_sql_postgresql" {
   source = "git::https://github.com/nullplatform/tofu-modules.git//nullplatform/service_package_installation?ref=v9.16.0"
 
