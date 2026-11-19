@@ -39,8 +39,8 @@ credentials, which come from Workload Identity instead of a secret.
 │   ├── specs/
 │   │   ├── service-spec.json.tpl         # Service schema (attributes the user sees)
 │   │   ├── links/database-user.json.tpl  # Link schema (access level, credentials)
-│   │   ├── requirements/gcp/             # OpenTofu: IAM for the worker, tfstate bucket
-│   │   └── install/gcp/                  # OpenTofu: standalone registration module
+│   │   └── requirements/gcp/             # OpenTofu: IAM for the worker, tfstate bucket
+│   ├── publish/                          # publishes the service as a package (release workflow only)
 │   ├── deployment/                       # OpenTofu module: instance, database, admin user
 │   ├── permissions/                      # OpenTofu module: role + grants (per link)
 │   ├── workflows/                    # Workflow YAMLs (create/update/delete/link/link-update/unlink/read)
@@ -142,7 +142,7 @@ links to two instances would both try to export `DATABASE_URL`.
 ### nullplatform prerequisites
 
 - An agent with worker orchestration enabled on a GKE cluster with Workload
-  Identity, and this service's package slug (`gcp-cloud-sql-postgresql`)
+  Identity, and this service's package slug (`np-gcp-cloud-sql-postgresql`)
   listed in the agent module's `worker_orchestrated_packages`. Listing it is
   what makes the worker pod run as the agent's Kubernetes service account
 - The worker's placement (region, VPC, tfstate bucket); see "Configuration"
@@ -210,26 +210,48 @@ GCP provider (whether the provider specification accepts it is not
 confirmed), so the documented install sets region, VPC and bucket in the
 worker's environment, as below.
 
-## How to register this service in nullplatform
+## Install in your organization
 
-Three pieces, in three layers.
+The service is published once as the package `np-gcp-cloud-sql-postgresql` (specification "GCP Cloud SQL PostgreSQL"), visible to every organization. You do not copy its specs: you install the package and use it read-only.
 
-**1 — The agent** must run the worker and give it the placement. In the
-[`nullplatform/agent`](https://github.com/nullplatform/tofu-modules/tree/main/nullplatform/agent)
-module:
+How installing a package works, how it coexists with a copy you registered, how to upgrade, and when to fork instead are in the [package installation guide](https://docs.nullplatform.com/docs/packages/install); this section has what is specific to this service.
+
+Already registered a copy from the former `cloud-sql-postgresql/specs/install`? It keeps working: it called tofu-modules' `service_definition` on specs that stay in every release, and the package installs next to it, as the guide explains. If you sourced that directory as a module, pin its `?ref` to a release that still has it.
+
+Installing it touches three layers: the GCP side, the agent, which runs the worker with its placement, and the nullplatform layer.
+
+| Layer | What | Module |
+|---|---|---|
+| infrastructure (GCP credentials) | The roles of the worker's identity, the tfstate bucket and the APIs | [`cloud-sql-postgresql/specs/requirements/gcp`](./cloud-sql-postgresql/specs/requirements/gcp) |
+| agent (Helm) | The package in `worker_orchestrated_packages`, and the placement its worker reads | tofu-modules' [`nullplatform/agent`](https://github.com/nullplatform/tofu-modules/tree/main/nullplatform/agent) |
+| nullplatform (nullplatform API key) | The installation of the package and the agent channel | tofu-modules' `service_package_installation` |
+
+Pick ONE release of this repository (the latest is on its [releases page](https://github.com/nullplatform/services-gcp-cloudsql-postgres/releases)) and use its version in both places below: the permissions are the ones the worker of that same release expects.
 
 ```hcl
-  worker_orchestrated_packages = ["containers", "gcp-cloud-sql-postgresql"]
+# ── infrastructure layer ─────────────────────────────────────────────
+module "cloud_sql_requirements" {
+  source         = "git::https://github.com/nullplatform/services-gcp-cloudsql-postgres.git//cloud-sql-postgresql/specs/requirements/gcp?ref=vX.Y.Z"
+  project_id     = "<gcp project>"
+  tfstate_bucket = "<dedicated GCS bucket for the tofu state>"
+  # agent_namespace and agent_service_account default to the agent module's
+  # (nullplatform-tools, nullplatform-agent); create_tfstate_bucket defaults
+  # to true and enable_apis to false.
+}
+
+# ── agent ────────────────────────────────────────────────────────────
+# In tofu-modules' nullplatform/agent:
+  worker_orchestrated_packages = ["containers", "np-gcp-cloud-sql-postgresql"]
 
   extra_envs = {
     SERVICES_GCP_REGION     = "<region>"
     SERVICES_GCP_NETWORK    = "<vpc name>"
-    SERVICES_TFSTATE_BUCKET = "<tfstate bucket>"
+    SERVICES_TFSTATE_BUCKET = "<tfstate bucket>" # the one the requirements module grants
   }
 
   worker = {
     patches = [{
-      target = { package = "gcp-cloud-sql-postgresql" }
+      target = { package = "np-gcp-cloud-sql-postgresql" }
       merge = {
         spec = {
           containers = [{
@@ -240,6 +262,20 @@ module:
       }
     }]
   }
+
+# ── nullplatform layer ───────────────────────────────────────────────
+# For a service the installation is the whole nullplatform side, channel included.
+module "cloud_sql_postgresql" {
+  source = "git::https://github.com/nullplatform/tofu-modules.git//nullplatform/service_package_installation?ref=v9.16.0"
+
+  nrn                  = var.nrn
+  package_slug         = "np-gcp-cloud-sql-postgresql"
+  package_version      = "X.Y.Z" # the same release, without the v
+  agent_tags_selectors = { cluster = "runtime" } # must match the agent's TAGS
+}
+# Keeping channels in a separate bindings layer instead? Use
+# nullplatform/package_installation here and service_definition_agent_association
+# there, with package_slug = "np-gcp-cloud-sql-postgresql".
 ```
 
 Listing the package in `worker_orchestrated_packages` is what runs its worker
@@ -250,58 +286,13 @@ secret (`<release>-secret-<chart>`, `nullplatform-agent-secret-nullplatform-agen
 with the module's defaults), which the patch mounts. Same model as the Azure
 services, minus the credentials: nothing secret is needed here.
 
-**2 — The service specification**, with the worker image pinned:
+To upgrade, move the release in both layers: `ref` of the requirements module and `package_version` of the installation. See tofu-modules' [`service_package_installation`](https://github.com/nullplatform/tofu-modules/tree/main/nullplatform/service_package_installation) for its inputs and outputs.
 
-```hcl
-module "service_definition_cloud_sql_postgresql" {
-  source              = "git::https://github.com/nullplatform/tofu-modules.git//nullplatform/service_definition?ref=<tofu-modules tag>"
-  nrn                 = var.nrn
-  service_path        = "cloud-sql-postgresql"
-  service_name        = "GCP Cloud SQL PostgreSQL"
-  repository_name     = "services-gcp-cloudsql-postgres"
-  repository_branch   = "<tag>"
-  repository_ref_type = "tags"
-  available_links     = ["database-user"]
+Prerequisites: an agent whose `TAGS` match the channel's `tags_selectors` and with `public.ecr.aws/nullplatform/*` in `worker.allowedRegistries`; the rest is in [Requirements](#requirements).
 
-  package = {
-    version = "<semver>"
-    artifacts = [{
-      name   = "worker-image"
-      type   = "oci_image"
-      lookup = true
-      meta = {
-        registry   = "public.ecr.aws"
-        repository = "nullplatform/agent-plugins/services/cloud-sql-postgresql"
-        tag        = "<tag>"
-      }
-    }]
-  }
-}
-```
+## How the package is published
 
-The module derives the package slug from `service_name` (lowercased, spaces
-to hyphens): "GCP Cloud SQL PostgreSQL" gives `gcp-cloud-sql-postgresql`, the
-`NP_PACKAGE_NAME` baked into the worker image. Another name applies cleanly
-and fails on first use.
-
-**3 — The channel association**, routing the action to the worker:
-
-```hcl
-module "service_agent_association_cloud_sql_postgresql" {
-  source                     = "git::https://github.com/nullplatform/tofu-modules.git//nullplatform/service_definition_agent_association?ref=<tofu-modules tag>"
-  nrn                        = var.nrn
-  service_path               = "cloud-sql-postgresql"
-  service_specification_slug = module.service_definition_cloud_sql_postgresql.service_specification_slug
-  tags_selectors             = var.tags_selectors
-
-  worker_orchestrator = true
-  package_slug        = module.service_definition_cloud_sql_postgresql.service_specification_slug
-}
-```
-
-A ready-made version of pieces 2 and 3 lives in
-[`cloud-sql-postgresql/specs/install/gcp/`](cloud-sql-postgresql/specs/install/gcp)
-for a standalone install.
+Every release publishes a new revision of the package from this repository, in the same run that pushes the worker image ([`.github/workflows/release.yml`](./.github/workflows/release.yml)): the `publish-package` job applies [`cloud-sql-postgresql/publish`](./cloud-sql-postgresql/publish), a stack on tofu-modules' `service_package_publish`, which pins this tag's specs and the image by digest. The package version is the release tag, as for the image.
 
 ## Important considerations
 
@@ -430,6 +421,7 @@ Set in this repository:
 |---|---|---|
 | `AWS_ROLE_ARN_ECR_PUSH` | secret | the publisher role ARN for `agent-plugins/services/cloud-sql-postgresql` |
 | `NP_ARTIFACT_NRN` | variable | the NRN of the organization that owns the artifacts |
+| `PACKAGE_STATE_AWS_ACCOUNT_ID`, `PACKAGE_TFSTATE_BUCKET`, `PACKAGE_TFSTATE_REGION` | organization secrets | where the publish stack keeps its state; the state role is `github-actions-<repository>-package-state` in that account, by convention |
 
 `ARTIFACT_NP_API_KEY` comes from the organization. The release checks all
 three before building and fails with a clear error if one is missing.
