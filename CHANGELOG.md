@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/nullplatform/services-gcp-cloudsql-postgres/compare/v1.0.1...v1.1.0) (2026-11-19)
+
+
+### Features
+
+* **package:** publish the service as a global package ([7b557d7](https://github.com/nullplatform/services-gcp-cloudsql-postgres/commit/7b557d78c9bcdc15a3feb2ac4db2a22234d4b7b2))
+* **package:** publish the service as a global package ([ce9daac](https://github.com/nullplatform/services-gcp-cloudsql-postgres/commit/ce9daac3c71b18e1f74e0841a16bff7a72a4e88d))
+
 ## [1.0.1](https://github.com/nullplatform/services-gcp-cloudsql-postgres/compare/v1.0.0...v1.0.1) (2026-11-16)
 
 
